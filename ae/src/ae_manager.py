@@ -1,5 +1,5 @@
 
-"""AE manager: tactical search-rush controller with TorchScript fallback."""
+"""AE manager: TorchScript policy with hard safety filtering."""
 
 from __future__ import annotations
 
@@ -101,45 +101,39 @@ class AEManager:
         danger = self._danger_map(view)
         origin = self._origin(view)
 
-        # 1) Survival first: if in blast/danger or just bombed, find a safe cell by BFS.
+        # Survival is the only hard override before the model.
         if self._is_dangerous_cell(danger, origin) or self.escape_ticks > 0 or self._local_danger_score(view) > 0.10:
             action = self._bfs_escape_action(view, danger, mask)
             return self._record(self._anti_loop_adjust(action, mask))
 
-        # 2) Place useful bomb only when escape path exists.
+        # Main path: let the model choose, but only among actions that pass
+        # immediate safety and bomb-lookahead filters.
+        safe_mask = self._safe_action_mask(observation, view, mask, danger)
+        action = self._policy_action(observation, safe_mask)
+        if action is not None:
+            return self._record(action)
+
+        # Fallback tactical stack if the model is missing or all safe actions fail.
         if self._should_bomb(observation, view, mask):
             self.escape_ticks = 5
             self.bomb_cooldown = 3
             self.last_bomb_step = step
             return self._record(PLACE_BOMB)
 
-        # 3) If a tactical local lookahead has a strong move, use it.
         action = self._beam_search_action(view, mask, depth=4, width=8)
         if action is not None:
             return self._record(self._anti_loop_adjust(action, mask))
 
-        # 4) Pathfind to visible targets instead of straight-line walking into obstacles.
         action = self._visible_bfs_target_action(view, mask)
         if action is not None:
             return self._record(self._anti_loop_adjust(action, mask))
 
-        # 5) Move toward remembered high-value target.
         action = self._remembered_target_action(observation, mask)
         if action is not None:
             return self._record(self._anti_loop_adjust(action, mask))
 
-        # 6) Sweep likely enemy territory instead of only local wandering.
-        action = self._strategic_sweep_action(observation, mask)
-        if action is not None:
-            return self._record(self._anti_loop_adjust(action, mask))
-
-        # 7) Exploration / loop breaker.
         action = self._explore_action(view, observation, mask)
-        action = self._anti_loop_adjust(action, mask)
-        fallback = self._policy_action(observation, mask)
-        if fallback is not None and fallback != STAY and (action == STAY or self._is_stuck()):
-            action = fallback
-        return self._record(action)
+        return self._record(self._anti_loop_adjust(action, mask))
 
     # ------------------------------------------------------------------
     # TorchScript policy fallback
@@ -222,6 +216,49 @@ class AEManager:
             dtype=np.float32,
         )
         return agent_view, base_view, scalars
+
+    def _safe_action_mask(
+        self,
+        obs: dict[str, Any],
+        view: np.ndarray,
+        mask: np.ndarray,
+        danger: np.ndarray,
+    ) -> np.ndarray:
+        safe = np.zeros(6, dtype=np.float32)
+        if view.ndim != 3:
+            return mask.copy()
+
+        origin = self._origin(view)
+        origin_safe = not self._is_dangerous_cell(danger, origin)
+
+        for action in range(6):
+            if not self._legal(mask, action):
+                continue
+
+            if action == PLACE_BOMB:
+                if self._should_bomb(obs, view, mask):
+                    safe[action] = 1.0
+                continue
+
+            if action in (FORWARD, BACKWARD):
+                dy, dx = ACTION_TO_LOCAL_DELTA[action]
+                p = (origin[0] + dy, origin[1] + dx)
+                if self._in_view(view, p) and not self._blocked(view, p) and not self._is_dangerous_cell(danger, p):
+                    safe[action] = 1.0
+                continue
+
+            # LEFT/RIGHT rotate in place, and STAY does not move.
+            if origin_safe:
+                safe[action] = 1.0
+
+        # STAY is safe but usually low-value. Let the model choose it only
+        # when it has no other safe legal action.
+        if safe[:4].sum() > 0 and self._legal(mask, STAY):
+            safe[STAY] = 0.0
+
+        if safe.sum() <= 0:
+            safe = mask.astype(np.float32, copy=True)
+        return safe
 
     def _policy_local_summary(self, view: np.ndarray) -> np.ndarray:
         if view.ndim != 3:
@@ -832,8 +869,8 @@ class AEManager:
 
     def _record(self, action: int) -> int:
         if int(action) == PLACE_BOMB:
-            self.escape_ticks = min(self.escape_ticks, 3)
-            self.bomb_cooldown = min(self.bomb_cooldown, 2)
+            self.escape_ticks = max(self.escape_ticks, 4)
+            self.bomb_cooldown = max(self.bomb_cooldown, 3)
         self.recent_actions.append(int(action))
         return int(action)
 

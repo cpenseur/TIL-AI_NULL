@@ -1,0 +1,18 @@
+.git
+pycache
+*.pyc
+
+# ignore training/data/output folders
+runs
+backups
+yolo
+advanced
+datasets
+data
+*.zip
+*.tar
+*.tar.gz
+
+# DON'T ignore source code/model
+!cv/src/
+!cv/src/**

@@ -24,17 +24,27 @@ class NLPManager:
         MODELS_DIR = Path(__file__).resolve().parents[1] / "models"
 
         # =====================================
-        # EMBEDDING MODEL
+        # DEVICE
+        # =====================================
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"NLPManager using device: {self.device}")
+
+        # =====================================
+        # EMBEDDING MODEL — on GPU if available
         # =====================================
         self.embedding_model = SentenceTransformer(
-            str(MODELS_DIR / "bge-base-en-v1.5")
+            str(MODELS_DIR / "bge-base-en-v1.5"),
+            device=self.device
         )
 
         # =====================================
-        # RERANKER
+        # RERANKER — on GPU if available
+        # This is the #1 speed bottleneck; GPU makes it ~10x faster
         # =====================================
         self.reranker = CrossEncoder(
-            str(MODELS_DIR / "bge-reranker-base")
+            str(MODELS_DIR / "bge-reranker-base"),
+            device=self.device,
+            max_length=512
         )
 
         # =====================================
@@ -52,6 +62,7 @@ class NLPManager:
         self.MODEL_NAME = str(MODELS_DIR / "Qwen2.5-1.5B-Instruct")
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+        self.tokenizer.padding_side = "left"  # required for batch generation
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.MODEL_NAME,
@@ -63,7 +74,7 @@ class NLPManager:
             "text-generation",
             model=self.model,
             tokenizer=self.tokenizer,
-            pad_token_id=self.tokenizer.eos_token_id  # suppress padding warning
+            pad_token_id=self.tokenizer.eos_token_id
         )
 
         # =====================================
@@ -96,38 +107,47 @@ class NLPManager:
         for doc in documents:
             doc_id = doc["id"]
             text = doc["document"]
-
-            split_chunks = self.text_splitter.split_text(text)
-
-            for chunk in split_chunks:
+            for chunk in self.text_splitter.split_text(text):
                 chunks.append(chunk)
                 chunk_to_doc.append(doc_id)
 
-        logger.info(f"load_corpus: {len(chunks)} chunks after splitting")
+        logger.info(f"load_corpus: {len(chunks)} total chunks")
 
         self.chunks = chunks
         self.chunk_to_doc = chunk_to_doc
 
         # =====================================
         # EMBEDDINGS
-        # batch_size=32 is safe for CPU; won't OOM
-        # show_progress_bar=False avoids tqdm overhead in server context
+        # Large batch size on GPU; fall back to 32 on CPU
         # =====================================
+        encode_batch = 256 if self.device == "cuda" else 32
         embeddings = self.embedding_model.encode(
             chunks,
             normalize_embeddings=True,
             show_progress_bar=False,
-            batch_size=32
+            batch_size=encode_batch
         ).astype("float32")
 
         self.chunk_embeddings = embeddings
 
         # =====================================
-        # FAISS (CPU only — safe on all envs)
+        # FAISS — GPU index if faiss-gpu is installed, else CPU
         # =====================================
         dim = embeddings.shape[1]
-        self.faiss_index = faiss.IndexFlatIP(dim)
-        self.faiss_index.add(embeddings)
+        cpu_index = faiss.IndexFlatIP(dim)
+        cpu_index.add(embeddings)
+
+        if self.device == "cuda" and hasattr(faiss, "StandardGpuResources"):
+            try:
+                res = faiss.StandardGpuResources()
+                self.faiss_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+                logger.info("FAISS: using GPU index")
+            except Exception as e:
+                logger.warning(f"FAISS GPU failed, falling back to CPU: {e}")
+                self.faiss_index = cpu_index
+        else:
+            self.faiss_index = cpu_index
+            logger.info("FAISS: using CPU index")
 
         # =====================================
         # BM25
@@ -136,11 +156,10 @@ class NLPManager:
         self.bm25 = BM25Okapi(tokenized_chunks)
 
         self.loaded = True
-        logger.info("load_corpus: done")
+        logger.info("load_corpus: complete")
 
     # =====================================
     # HYBRID RETRIEVAL
-    # Wider funnel than original (was dense_k=20, sparse_k=20, top_k=8)
     # =====================================
     def hybrid_retrieve(
         self,
@@ -170,53 +189,41 @@ class NLPManager:
         if sparse_k >= len(bm25_scores):
             top_sparse_idx = np.argsort(bm25_scores)[::-1]
         else:
-            top_sparse_idx = np.argpartition(
-                bm25_scores, -sparse_k
-            )[-sparse_k:]
+            top_sparse_idx = np.argpartition(bm25_scores, -sparse_k)[-sparse_k:]
 
         sparse_scores = {
             int(i): float(bm25_scores[i])
             for i in top_sparse_idx
         }
 
-        candidates = sorted(
-            set(dense_scores.keys()) | set(sparse_scores.keys())
-        )
+        candidates = sorted(set(dense_scores.keys()) | set(sparse_scores.keys()))
 
         if not candidates:
             return []
 
         svals = np.array(
-            [sparse_scores.get(i, 0.0) for i in candidates],
-            dtype="float32"
+            [sparse_scores.get(i, 0.0) for i in candidates], dtype="float32"
         )
+        smin, smax = float(svals.min()), float(svals.max())
 
-        smin = float(svals.min())
-        smax = float(svals.max())
-
-        def normalize_sparse(v: float) -> float:
+        def norm_sparse(v: float) -> float:
             return (v - smin) / (smax - smin + 1e-9)
 
         combined = []
-
         for idx in candidates:
             dense = dense_scores.get(idx, 0.0)
-            sparse = normalize_sparse(sparse_scores.get(idx, 0.0))
-            score = alpha * dense + (1 - alpha) * sparse
-
+            sparse = norm_sparse(sparse_scores.get(idx, 0.0))
             combined.append({
                 "chunk": self.chunks[idx],
                 "doc_id": self.chunk_to_doc[idx],
-                "score": float(score)
+                "score": float(alpha * dense + (1 - alpha) * sparse)
             })
 
         combined.sort(key=lambda x: x["score"], reverse=True)
-
         return combined[:top_k]
 
     # =====================================
     # RERANK
-    # top_k raised from 3 → 5 so reranker sees more candidates
     # =====================================
     def rerank(self, question: str, retrieved: list[dict], top_k: int = 5) -> list[dict]:
 
@@ -224,30 +231,22 @@ class NLPManager:
             return []
 
         pairs = [[question, r["chunk"]] for r in retrieved]
-        scores = self.reranker.predict(pairs)
+        scores = self.reranker.predict(pairs, batch_size=64, show_progress_bar=False)
 
-        reranked = []
-
-        for r, s in zip(retrieved, scores):
-            reranked.append({
-                **r,
-                "rerank_score": float(s)
-            })
-
-        reranked.sort(key=lambda x: x["rerank_score"], reverse=True)
-
+        reranked = sorted(
+            [{**r, "rerank_score": float(s)} for r, s in zip(retrieved, scores)],
+            key=lambda x: x["rerank_score"],
+            reverse=True
+        )
         return reranked[:top_k]
 
     # =====================================
     # PROMPT
-    # Simplified vs original — shorter prompts work better on 1.5B models
     # =====================================
     def build_prompt(self, question: str, contexts: list[str]) -> str:
-
         context_text = "\n\n".join(
             [f"[{i+1}] {c}" for i, c in enumerate(contexts)]
         )
-
         return (
             "Answer the question using only the contexts below.\n"
             "Output the exact answer only, as short as possible.\n"
@@ -258,96 +257,102 @@ class NLPManager:
         )
 
     # =====================================
-    # QA — single question (used by server per-question calls)
-    # =====================================
-    def qa(self, question: str) -> dict:
-
-        # 1. RETRIEVE — wider funnel than original
-        retrieved = self.hybrid_retrieve(
-            question,
-            dense_k=50,
-            sparse_k=50,
-            top_k=20
-        )
-
-        if not retrieved:
-            return {"documents": [], "answer": ""}
-
-        # 2. RERANK
-        reranked = self.rerank(question, retrieved, top_k=5)
-
-        if not reranked:
-            return {"documents": [], "answer": ""}
-
-        # =====================================
-        # ALWAYS collect documents before any answer decision.
-        # Returning docs with empty answer = 0.4 pts.
-        # Returning nothing = 0.0 pts.
-        # =====================================
-        documents = []
-        for r in reranked:
-            if r["doc_id"] not in documents:
-                documents.append(r["doc_id"])
-            if len(documents) == 3:
-                break
-
-        # =====================================
-        # SOFT ABSTENTION — only skip generation if reranker
-        # is extremely unconfident. Still return documents.
-        # =====================================
-        top1 = reranked[0]["rerank_score"]
-        if top1 < -5.0:  # effectively never fires; safety net only
-            return {"documents": documents, "answer": ""}
-
-        # 3. BUILD CONTEXT + PROMPT
-        contexts = [r["chunk"] for r in reranked]
-        prompt = self.build_prompt(question, contexts)
-
-        # 4. GENERATE
-        output = self.generator(
-            prompt,
-            max_new_tokens=80,       # was 40 — enough for multi-part answers
-            do_sample=False,
-            repetition_penalty=1.1,  # prevents looping/repetition
-            return_full_text=False
-        )
-
-        raw = output[0]["generated_text"].strip()
-        answer = raw.split("\n")[0].strip()
-        answer = answer.replace("Answer:", "").strip()
-
-        # 5. NOT_FOUND → empty answer but keep documents for partial credit
-        if answer.upper().startswith("NOT_FOUND"):
-            return {"documents": documents, "answer": ""}
-
-        return {
-            "documents": documents,
-            "answer": answer
-        }
-
-    # =====================================
-    # QA BATCH — call this from your server when handling a
-    # batch of questions for much better LLM throughput
+    # QA BATCH — primary entry point
+    # Call this from your server with the full batch of questions
+    # instead of looping qa() one at a time
     # =====================================
     def qa_batch(self, questions: list[str]) -> list[dict]:
         """
-        Process a list of questions together, batching the LLM call.
-        Drop-in replacement for calling qa() in a loop.
+        Full RAG pipeline over a batch of questions.
+        Reranker and LLM are called in bulk — much faster than qa() in a loop.
         """
-        # Stage 1: retrieve + rerank for each question
-        batch_meta = []  # None or (documents, contexts)
+        # ── Stage 1: embed all questions at once ──────────────────────────
+        q_embs = self.embedding_model.encode(
+            questions,
+            normalize_embeddings=True,
+            batch_size=64,
+            show_progress_bar=False
+        ).astype("float32")
 
-        for question in questions:
-            retrieved = self.hybrid_retrieve(question, dense_k=50, sparse_k=50, top_k=20)
+        # ── Stage 2: FAISS + BM25 per question ────────────────────────────
+        all_candidates = []   # list of list[dict] or []
 
-            if not retrieved:
-                batch_meta.append(None)
+        for q_idx, question in enumerate(questions):
+            q_emb = q_embs[q_idx : q_idx + 1]
+            D, I = self.faiss_index.search(q_emb, 50)
+
+            dense_scores = {
+                int(idx): float(score)
+                for score, idx in zip(D[0], I[0])
+                if idx >= 0
+            }
+
+            q_tok = self.bm25_tokenize(question)
+            bm25_scores = self.bm25.get_scores(q_tok)
+            top_sparse_idx = np.argpartition(bm25_scores, -50)[-50:] \
+                if len(bm25_scores) >= 50 else np.argsort(bm25_scores)[::-1]
+            sparse_scores = {int(i): float(bm25_scores[i]) for i in top_sparse_idx}
+
+            candidates = sorted(set(dense_scores.keys()) | set(sparse_scores.keys()))
+            if not candidates:
+                all_candidates.append([])
                 continue
 
-            reranked = self.rerank(question, retrieved, top_k=5)
+            svals = np.array([sparse_scores.get(i, 0.0) for i in candidates], dtype="float32")
+            smin, smax = float(svals.min()), float(svals.max())
 
+            retrieved = []
+            for idx in candidates:
+                dense = dense_scores.get(idx, 0.0)
+                sparse = (sparse_scores.get(idx, 0.0) - smin) / (smax - smin + 1e-9)
+                retrieved.append({
+                    "chunk": self.chunks[idx],
+                    "doc_id": self.chunk_to_doc[idx],
+                    "score": float(0.65 * dense + 0.35 * sparse)
+                })
+
+            retrieved.sort(key=lambda x: x["score"], reverse=True)
+            all_candidates.append(retrieved[:20])
+
+        # ── Stage 3: batch rerank — ONE reranker call for all questions ───
+        # Flatten all pairs, call predict once, then re-slice
+        all_pairs = []
+        pair_map = []   # (q_idx, chunk_idx_within_question)
+
+        for q_idx, candidates in enumerate(all_candidates):
+            for c_idx, c in enumerate(candidates):
+                all_pairs.append([questions[q_idx], c["chunk"]])
+                pair_map.append((q_idx, c_idx))
+
+        if not all_pairs:
+            return [{"documents": [], "answer": ""} for _ in questions]
+
+        # Single batched reranker call — the big speedup
+        all_scores = self.reranker.predict(
+            all_pairs,
+            batch_size=256,          # large batch = GPU fully utilised
+            show_progress_bar=False
+        )
+
+        # Re-attach scores and pick top 5 per question
+        per_question_scored: list[list[dict]] = [[] for _ in questions]
+        for (q_idx, c_idx), score in zip(pair_map, all_scores):
+            entry = {**all_candidates[q_idx][c_idx], "rerank_score": float(score)}
+            per_question_scored[q_idx].append(entry)
+
+        reranked_all = []
+        for scored in per_question_scored:
+            scored.sort(key=lambda x: x["rerank_score"], reverse=True)
+            reranked_all.append(scored[:5])
+
+        # ── Stage 4: collect documents + build prompts ────────────────────
+        prompts = []
+        active_indices = []
+        doc_lists = []
+
+        for q_idx, reranked in enumerate(reranked_all):
             if not reranked:
-                batch_meta.append(None)
+                doc_lists.append([])
                 continue
 
             documents = []
@@ -357,38 +362,28 @@ class NLPManager:
                 if len(documents) == 3:
                     break
 
+            doc_lists.append(documents)
             contexts = [r["chunk"] for r in reranked]
-            batch_meta.append((documents, contexts))
+            prompts.append(self.build_prompt(questions[q_idx], contexts))
+            active_indices.append(q_idx)
 
-        # Stage 2: collect prompts for non-empty entries
-        prompts = []
-        active_indices = []
-
-        for i, meta in enumerate(batch_meta):
-            if meta is not None:
-                documents, contexts = meta
-                prompts.append(self.build_prompt(questions[i], contexts))
-                active_indices.append(i)
+        # ── Stage 5: batched LLM generation ──────────────────────────────
+        results = [{"documents": [], "answer": ""} for _ in questions]
 
         if not prompts:
-            return [{"documents": [], "answer": ""} for _ in questions]
+            return results
 
-        # Stage 3: single batched LLM call
         outputs = self.generator(
             prompts,
             max_new_tokens=80,
             do_sample=False,
             repetition_penalty=1.1,
             return_full_text=False,
-            batch_size=4  # safe for 1.5B; increase to 8 if GPU VRAM allows
+            batch_size=8            # increase to 16 if VRAM allows
         )
 
-        # Stage 4: assemble results
-        results = [{"documents": [], "answer": ""} for _ in questions]
-
+        # ── Stage 6: assemble ─────────────────────────────────────────────
         for out_idx, q_idx in enumerate(active_indices):
-            documents, _ = batch_meta[q_idx]
-
             raw = outputs[out_idx][0]["generated_text"].strip()
             answer = raw.split("\n")[0].strip()
             answer = answer.replace("Answer:", "").strip()
@@ -396,6 +391,15 @@ class NLPManager:
             if answer.upper().startswith("NOT_FOUND"):
                 answer = ""
 
-            results[q_idx] = {"documents": documents, "answer": answer}
+            results[q_idx] = {
+                "documents": doc_lists[q_idx],
+                "answer": answer
+            }
 
         return results
+
+    # =====================================
+    # QA — single question wrapper (backward compat)
+    # =====================================
+    def qa(self, question: str) -> dict:
+        return self.qa_batch([question])[0]
