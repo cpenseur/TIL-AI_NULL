@@ -1,0 +1,7 @@
+# Dependencies for AE.
+
+fastapi
+numpy
+torch
+uvicorn[standard]
+

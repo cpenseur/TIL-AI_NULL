@@ -1,0 +1,18 @@
+# Dependencies for the NLP container.
+
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+asyncio
+torch
+transformers
+sentence-transformers
+langchain
+langchain-community
+langchain-text-splitters
+faiss-cpu
+rank-bm25
+numpy
+accelerate
+bitsandbytes
+einops
+scipy
